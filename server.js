@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const axios = require('axios');
 const https = require('https');
@@ -10,11 +12,11 @@ app.use(express.json());
 // ========================
 // CONFIG (EDIT THESE)
 // ========================
-const MGR_PASSCODE = "0504332222";
-const TERMINAL_TOKEN = "6945595921271780";
-const TERMINAL_IP = "192.168.1.14";
-const TERMINAL_TID = "N860W0R7030";
-const TERMINAL_VERSION = "1.2.0";
+const MGR_PASSCODE = process.env.MGR_PASSCODE;
+const TERMINAL_TOKEN = process.env.TERMINAL_TOKEN;
+const TERMINAL_IP = process.env.TERMINAL_IP;
+const TERMINAL_TID = process.env.TERMINAL_TID;
+const TERMINAL_VERSION = process.env.TERMINAL_VERSION;
 
 const POLL_INTERVAL_MS = 1500;
 const POLL_TIMEOUT_MS = 120000;
