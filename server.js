@@ -10,17 +10,44 @@ const app = express();
 app.use(express.json());
 
 // ========================
-// CONFIG (EDIT THESE)
+// GLOBAL CONFIG
 // ========================
 const MGR_PASSCODE = process.env.MGR_PASSCODE;
-const TERMINAL_TOKEN = process.env.TERMINAL_TOKEN;
-const TERMINAL_IP = process.env.TERMINAL_IP;
-const TERMINAL_TID = process.env.TERMINAL_TID;
-const TERMINAL_VERSION = process.env.TERMINAL_VERSION;
 
+const TERMINAL_VERSION = process.env.TERMINAL_VERSION || "1.2.0";
+
+// Polling behavior
 const POLL_INTERVAL_MS = 1500;
 const POLL_TIMEOUT_MS = 120000;
-// ========================
+
+// Two terminals (set these in .env)
+const TERMINALS = {
+  islandtech: {
+    key: "islandtech",
+    name: "Island Tech",
+    ip: process.env.TERMINAL_IP_ISLANDTECH,
+    tid: process.env.TERMINAL_TID_ISLANDTECH,
+    token: process.env.TERMINAL_TOKEN_ISLANDTECH,
+  },
+  computergeeks: {
+    key: "computergeeks",
+    name: "The Computer Geeks",
+    ip: process.env.TERMINAL_IP_COMPUTERGEEKS,
+    tid: process.env.TERMINAL_TID_COMPUTERGEEKS,
+    token: process.env.TERMINAL_TOKEN_COMPUTERGEEKS,
+  }
+};
+
+// Validate basic config
+function assertConfig() {
+  if (!MGR_PASSCODE) console.warn("WARNING: MGR_PASSCODE is missing");
+  for (const t of Object.values(TERMINALS)) {
+    if (!t.ip || !t.tid || !t.token) {
+      console.warn(`WARNING: Terminal config incomplete for ${t.key} (need IP/TID/TOKEN)`);
+    }
+  }
+}
+assertConfig();
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
@@ -56,15 +83,21 @@ app.options(/.*/, (req, res) => {
 });
 
 // --- State ---
-let busy = false;
-const processed = new Set(); // idempotency by payment_uuid
+// Busy lock PER TERMINAL (so both can run simultaneously on different devices)
+const terminalBusy = {
+  islandtech: false,
+  computergeeks: false
+};
+
+// Idempotency (MGR retries can happen)
+const processed = new Set(); // payment_uuid
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// Completed GET /transaction returns responseCode + transApproved flags per DNA axept® PRO docs
 function isApprovedFromCompletedBody(body) {
-  // DNA doc: completed GET /transaction returns responseCode and transApproved etc. :contentReference[oaicite:2]{index=2}
   const code = String(
     body?.responseCode ??
     body?.transactionResponse?.responseCode ??
@@ -74,7 +107,7 @@ function isApprovedFromCompletedBody(body) {
   const transApproved = body?.transApproved === true || body?.approved === true;
   const transCancelled = body?.transCancelled === true;
 
-  // Common approvals listed include 00 and 85; also offline approvals like Y1/Y3. :contentReference[oaicite:3]{index=3}
+  // Common approvals include 00 and 85; offline approvals can be Y1/Y3 in some setups
   const APPROVAL_CODES = new Set(["00", "85", "Y1", "Y3"]);
   const DENIAL_CODES = new Set(["02", "03", "05", "21", "30", "55", "63", "96", "98", "99", "Z1", "Z3"]);
 
@@ -84,15 +117,11 @@ function isApprovedFromCompletedBody(body) {
   if (APPROVAL_CODES.has(code)) return { final: true, status: "APPROVED" };
   if (DENIAL_CODES.has(code)) return { final: true, status: "DENIED" };
 
-  // If we got a responseCode and it's not one of the approvals, treat as denial (safer for MGR)
-  if (code) return { final: true, status: "DENIED" };
-
-  // Missing fields — treat as not final / unknown (shouldn't happen on HTTP 200, but be safe)
+  if (code) return { final: true, status: "DENIED" }; // any other code → deny to be safe
   return { final: false };
 }
 
 function extractAuthAndRef(body) {
-  // These are optional for MGR
   const auth_code =
     body?.authorisationCode ||
     body?.authorizationCode ||
@@ -135,17 +164,17 @@ async function notifyMGR(payment_uuid, status, auth_code, txn_ref) {
   }
 }
 
-async function startTransaction(minorUnits, reference) {
+async function startTransaction(terminal, minorUnits, reference) {
   const url =
-    `https://${TERMINAL_IP}:8080/POSitiveWebLink/${TERMINAL_VERSION}/rest/transaction` +
-    `?tid=${encodeURIComponent(TERMINAL_TID)}&disablePrinting=true`;
+    `https://${terminal.ip}:8080/POSitiveWebLink/${TERMINAL_VERSION}/rest/transaction` +
+    `?tid=${encodeURIComponent(terminal.tid)}&disablePrinting=true`;
 
   return axios.post(
     url,
     { transType: "SALE", amountTrans: minorUnits, reference },
     {
       headers: {
-        Authorization: `Bearer ${TERMINAL_TOKEN}`,
+        Authorization: `Bearer ${terminal.token}`,
         "Content-Type": "application/json"
       },
       httpsAgent,
@@ -154,26 +183,29 @@ async function startTransaction(minorUnits, reference) {
   );
 }
 
-async function pollTransactionByUti(uti) {
-  // Per DNA docs: poll GET /transaction with tid + uti. :contentReference[oaicite:4]{index=4}
+async function pollTransactionByUti(terminal, uti) {
+  // Per DNA docs: poll GET /transaction with tid + uti
   const url =
-    `https://${TERMINAL_IP}:8080/POSitiveWebLink/${TERMINAL_VERSION}/rest/transaction` +
-    `?tid=${encodeURIComponent(TERMINAL_TID)}&uti=${encodeURIComponent(uti)}`;
+    `https://${terminal.ip}:8080/POSitiveWebLink/${TERMINAL_VERSION}/rest/transaction` +
+    `?tid=${encodeURIComponent(terminal.tid)}&uti=${encodeURIComponent(uti)}`;
 
   return axios.get(url, {
-    headers: { Authorization: `Bearer ${TERMINAL_TOKEN}` },
+    headers: { Authorization: `Bearer ${terminal.token}` },
     httpsAgent,
     timeout: 10000,
-    // allow us to handle 206 as a normal response
-    validateStatus: () => true
+    validateStatus: () => true // so we can read 206 without throwing
   });
 }
 
-// --- Routes ---
-app.get('/health', (req, res) => res.status(200).send("ok"));
+// Shared handler for both payment methods
+async function handleMgrPayment(req, res, terminalKey) {
+  const terminal = TERMINALS[terminalKey];
+  if (!terminal || !terminal.ip || !terminal.tid || !terminal.token) {
+    log(`Terminal not configured for key=${terminalKey}`);
+    return res.status(500).send("Terminal not configured");
+  }
 
-app.post('/mgr/start-payment', async (req, res) => {
-  log(`WEBHOOK headers=${JSON.stringify(req.headers)} body=${JSON.stringify(req.body)}`);
+  log(`WEBHOOK (${terminal.name}) headers=${JSON.stringify(req.headers)} body=${JSON.stringify(req.body)}`);
 
   if (req.headers['x-mgr-passcode'] !== MGR_PASSCODE) {
     log("Unauthorized webhook attempt (bad passcode)");
@@ -188,35 +220,37 @@ app.post('/mgr/start-payment', async (req, res) => {
     return res.status(400).json({ ok: false, error: "Invalid payload" });
   }
 
-  // ACK MGR immediately (per MGR docs)
+  // ACK MGR immediately (MGR expects 202)
   res.status(202).send("Accepted");
 
-  // Idempotency
+  // Idempotency (MGR retries)
   if (processed.has(payment_uuid)) {
     log(`Duplicate webhook ignored for payment_uuid=${payment_uuid}`);
     return;
   }
 
-  if (busy) {
-    log("Terminal busy - refusing new transaction");
+  // Per-terminal busy lock
+  if (terminalBusy[terminalKey]) {
+    log(`Terminal busy (${terminal.name}) - refusing new transaction`);
+    processed.add(payment_uuid); // prevent hammering
     await notifyMGR(payment_uuid, "DENIED");
     return;
   }
 
-  busy = true;
+  terminalBusy[terminalKey] = true;
   processed.add(payment_uuid);
 
   const minorUnits = Math.round(amount * 100);
-  log(`Starting SALE: £${amount} (${minorUnits}) payment_uuid=${payment_uuid}`);
+  log(`Starting SALE on ${terminal.name}: £${amount} (${minorUnits}) payment_uuid=${payment_uuid}`);
 
   try {
-    // 1) Start transaction (expect UTI back in body for 200/201) :contentReference[oaicite:5]{index=5}
-    const startResp = await startTransaction(minorUnits, payment_uuid);
-    log(`Terminal start HTTP ${startResp.status} data=${JSON.stringify(startResp.data)}`);
+    // 1) Start transaction -> returns UTI
+    const startResp = await startTransaction(terminal, minorUnits, payment_uuid);
+    log(`Terminal start (${terminal.name}) HTTP ${startResp.status} data=${JSON.stringify(startResp.data)}`);
 
     const uti = startResp.data?.uti;
     if (!uti) {
-      log("No UTI returned from POST /transaction; cannot poll. Denying.");
+      log(`No UTI returned from POST /transaction (${terminal.name}); denying.`);
       await notifyMGR(payment_uuid, "DENIED");
       return;
     }
@@ -228,10 +262,10 @@ app.post('/mgr/start-payment', async (req, res) => {
     while (Date.now() < deadline) {
       await sleep(POLL_INTERVAL_MS);
 
-      const pollResp = await pollTransactionByUti(uti);
+      const pollResp = await pollTransactionByUti(terminal, uti);
 
-      // 206 = in progress (keep polling); 200 = completed :contentReference[oaicite:6]{index=6}
-      log(`Poll UTI=${uti} HTTP ${pollResp.status} data=${JSON.stringify(pollResp.data)}`);
+      // 206 = in progress, 200 = completed
+      log(`Poll (${terminal.name}) UTI=${uti} HTTP ${pollResp.status} data=${JSON.stringify(pollResp.data)}`);
       lastBody = pollResp.data;
 
       if (pollResp.status === 206) continue;
@@ -239,36 +273,41 @@ app.post('/mgr/start-payment', async (req, res) => {
       if (pollResp.status === 200) {
         const parsed = isApprovedFromCompletedBody(pollResp.data);
         if (!parsed.final) {
-          // Should be final at 200, but be defensive.
-          log(`HTTP 200 but not final parse; denying for safety. UTI=${uti}`);
+          log(`HTTP 200 but not final parse (${terminal.name}); denying. UTI=${uti}`);
           await notifyMGR(payment_uuid, "DENIED");
           return;
         }
 
         const { auth_code, txn_ref } = extractAuthAndRef(pollResp.data);
-        log(`Final result UTI=${uti}: ${parsed.status}`);
+        log(`Final result (${terminal.name}) UTI=${uti}: ${parsed.status}`);
         await notifyMGR(payment_uuid, parsed.status, auth_code, txn_ref);
         return;
       }
 
-      // 404 can happen briefly if not available yet; keep polling a bit
-      if (pollResp.status === 404) continue;
+      if (pollResp.status === 404) continue; // can occur briefly
 
-      // Auth/input/timeouts etc — treat as failure
-      log(`Unexpected poll HTTP ${pollResp.status} for UTI=${uti}; denying.`);
+      log(`Unexpected poll HTTP ${pollResp.status} (${terminal.name}) for UTI=${uti}; denying.`);
       await notifyMGR(payment_uuid, "DENIED");
       return;
     }
 
-    log(`Timed out waiting for completion. UTI=${uti} lastBody=${JSON.stringify(lastBody)}`);
+    log(`Timed out waiting for completion (${terminal.name}). UTI=${uti} lastBody=${JSON.stringify(lastBody)}`);
     await notifyMGR(payment_uuid, "DENIED");
+
   } catch (err) {
-    log(`Terminal error for ${payment_uuid}: msg=${err?.message || err} http=${err?.response?.status} data=${JSON.stringify(err?.response?.data)}`);
+    log(`Terminal error (${terminal.name}) for ${payment_uuid}: msg=${err?.message || err} http=${err?.response?.status} data=${JSON.stringify(err?.response?.data)}`);
     await notifyMGR(payment_uuid, "DENIED");
   } finally {
-    busy = false;
+    terminalBusy[terminalKey] = false;
   }
-});
+}
+
+// --- Routes ---
+app.get('/health', (req, res) => res.status(200).send("ok"));
+
+// Two webhook URLs (map each MGR payment method to one of these)
+app.post('/mgr/islandtech/start-payment', (req, res) => handleMgrPayment(req, res, 'islandtech'));
+app.post('/mgr/computergeeks/start-payment', (req, res) => handleMgrPayment(req, res, 'computergeeks'));
 
 // Catch-all
 app.use((req, res) => {
